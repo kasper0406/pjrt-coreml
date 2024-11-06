@@ -33,6 +33,24 @@ use log::{debug, info, warn};
 static mut COREML_DEVICES_POINTERS: Vec<*mut PJRT_Device> = vec![];
 static mut COREML_MEMORYS_POINTERS: Vec<*mut PJRT_Memory> = vec![];
 
+struct Error {
+    pjrt_error: PJRT_Error,
+
+    message: CString,
+    error_code: PJRT_Error_Code,
+}
+
+impl Error {
+    fn new_alloc(message: String) -> *mut PJRT_Error {
+        Box::into_raw(Box::new(Error {
+            pjrt_error: PJRT_Error { _unused: [0; 0] },
+            message: CString::new(message).unwrap(),
+            // TODO(knielsen): Support additional error codes...
+            error_code: PJRT_Error_Code_PJRT_Error_Code_INTERNAL,
+        })) as *mut PJRT_Error
+    }
+}
+
 struct Device {
     device: Box<PJRT_Device>,
     description: CString,
@@ -116,6 +134,7 @@ impl Buffer {
     }
 }
 
+#[derive(Debug)]
 struct EventCallback {
     callback: PJRT_Event_OnReadyCallback,
     user_arg: *mut c_void,
@@ -158,7 +177,7 @@ impl Event {
             let mut callback_info = callback_info_ref.lock().unwrap();
             callback_info.task_completed = true;
             for callback in callback_info.callbacks.iter() {
-                debug!("Background task completed, calling callback");
+                debug!("Background task completed, calling callback: {:?}", callback);
                 unsafe { callback.callback.unwrap()(ptr::null_mut(), callback.user_arg) };
             }
             callback_info.callbacks.clear();
@@ -216,6 +235,37 @@ lazy_static! {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn ErrorDestroy(arg_ptr: *mut PJRT_Error_Destroy_Args) -> () {
+    info!("ErrorDestroy was called");
+
+    let error_ptr = (*arg_ptr).error;
+    if error_ptr.is_null() {
+        debug!("ErrorDestroy called on a nullptr");
+    } else {
+        drop(Box::from_raw(error_ptr));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ErrorMessage(arg_ptr: *mut PJRT_Error_Message_Args) -> () {
+    info!("ErrorMessage was called");
+
+    let error_ptr = (*arg_ptr).error as *mut Error;
+    (*arg_ptr).message = (*error_ptr).message.as_ptr();
+    (*arg_ptr).message_size = (*error_ptr).message.count_bytes();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ErrorGetCode(arg_ptr: *mut PJRT_Error_GetCode_Args) -> *mut PJRT_Error {
+    info!("ErrorGetCode was called");
+
+    let error_ptr = (*arg_ptr).error as *mut Error;
+    (*arg_ptr).code = (*error_ptr).error_code;
+
+    ptr::null_mut()
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn PluginInitialize(arg_ptr: *mut PJRT_Plugin_Initialize_Args) -> *mut PJRT_Error {
     info!("PluginInitialize was called...");
     env_logger::init();
@@ -234,7 +284,14 @@ pub unsafe extern "C" fn PluginAttributes(arg_ptr: *mut PJRT_Plugin_Attributes_A
 
 #[no_mangle]
 pub unsafe extern "C" fn EventDestroy(arg_ptr: *mut PJRT_Event_Destroy_Args) -> *mut PJRT_Error {
-    todo!("EventDestroy was called...")
+    info!("EventDestroy was called...");
+
+    let event_ptr = (*arg_ptr).event as *mut Event;
+    if !event_ptr.is_null() {
+        drop(Box::from_raw(event_ptr));
+    }
+
+    ptr::null_mut()
 }
 
 #[no_mangle]
@@ -481,6 +538,31 @@ pub unsafe extern "C" fn Client_TopologyDescription(arg_ptr: *mut PJRT_Client_To
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn CopyToDeviceStreamDestroy(arg_ptr: *mut PJRT_CopyToDeviceStream_Destroy_Args) -> *mut PJRT_Error {
+    todo!("Implement CopyToDeviceStreamDestroy")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn CopyToDeviceStreamAddChunk(arg_ptr: *mut PJRT_CopyToDeviceStream_AddChunk_Args) -> *mut PJRT_Error {
+    todo!("Implement CopyToDeviceStreamAddChunk")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn CopyToDeviceStreamTotalBytes(arg_ptr: *mut PJRT_CopyToDeviceStream_TotalBytes_Args) -> *mut PJRT_Error {
+    todo!("Implement CopyToDeviceStreamTotalBytes")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn CopyToDeviceStreamGranuleSize(arg_ptr: *mut PJRT_CopyToDeviceStream_GranuleSize_Args) -> *mut PJRT_Error {
+    todo!("Implement CopyToDeviceStreamGranuleSize")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn CopyToDeviceStreamCurrentBytes(arg_ptr: *mut PJRT_CopyToDeviceStream_CurrentBytes_Args) -> *mut PJRT_Error {
+    todo!("Implement CopyToDeviceStreamCurrentBytes")
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn TopologyDescriptionCreate(arg_ptr: *mut PJRT_TopologyDescription_Create_Args) -> *mut PJRT_Error {
     info!("TopologyDescriptionCreate was called...");
 
@@ -698,7 +780,7 @@ pub unsafe extern "C" fn LoadedExecutableExecute(arg_ptr: *mut PJRT_LoadedExecut
     if !(*arg_ptr).device_complete_events.is_null() {
         let future = task::spawn(async {
             info!("Pretending to run computation in the background...");
-            task::sleep(std::time::Duration::from_secs(1)).await;
+            task::sleep(std::time::Duration::from_secs(10)).await;
             info!("Finished pretended computation...");
         });
         let event = Box::new(Event::new(future));
@@ -892,6 +974,11 @@ pub unsafe extern "C" fn BufferCopyToMemory(arg_ptr: *mut PJRT_Buffer_CopyToMemo
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn ClientBufferFromHostBuffer(arg_ptr: *mut PJRT_Client_BufferFromHostBuffer_Args) -> *mut PJRT_Error {
+    todo!("ClientBufferFromHostBuffer missing")
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn ClientCreateViewOfDeviceBuffer(arg_ptr: *mut PJRT_Client_CreateViewOfDeviceBuffer_Args) -> *mut PJRT_Error {
     todo!("ClientCreateViewOfDeviceBuffer missing")
 }
@@ -992,9 +1079,9 @@ pub unsafe extern "C" fn GetPjrtApi() -> *mut PJRT_Api {
         struct_size: 0,
         extension_start: ptr::null_mut(),
         pjrt_api_version: pjrt_version,
-        PJRT_Error_Destroy: None,
-        PJRT_Error_Message: None,
-        PJRT_Error_GetCode: None,
+        PJRT_Error_Destroy: Some(ErrorDestroy),
+        PJRT_Error_Message: Some(ErrorMessage),
+        PJRT_Error_GetCode: Some(ErrorGetCode),
         PJRT_Plugin_Initialize: Some(PluginInitialize),
         PJRT_Plugin_Attributes: Some(PluginAttributes),
         PJRT_Event_Destroy: Some(EventDestroy),
@@ -1014,7 +1101,7 @@ pub unsafe extern "C" fn GetPjrtApi() -> *mut PJRT_Api {
         PJRT_Client_AddressableMemories: Some(ClientAddressableMemories),
         PJRT_Client_Compile: Some(ClientCompile),
         PJRT_Client_DefaultDeviceAssignment: None,
-        PJRT_Client_BufferFromHostBuffer: None,
+        PJRT_Client_BufferFromHostBuffer: Some(ClientBufferFromHostBuffer),
         PJRT_DeviceDescription_Id: Some(DeviceDescriptionId),
         PJRT_DeviceDescription_ProcessIndex: Some(DeviceDescriptiopnProcessIndex),
         PJRT_DeviceDescription_Attributes: Some(DeviceDescriptionAttributes),
@@ -1069,11 +1156,11 @@ pub unsafe extern "C" fn GetPjrtApi() -> *mut PJRT_Api {
         PJRT_Buffer_IncreaseExternalReferenceCount: Some(BufferIncreaseRefCount),
         PJRT_Buffer_DecreaseExternalReferenceCount: Some(BufferDecreaseRefCount),
         PJRT_Buffer_OpaqueDeviceMemoryDataPointer: Some(BufferOpaqueDeviceMemoryDataPointer),
-        PJRT_CopyToDeviceStream_Destroy: None,
-        PJRT_CopyToDeviceStream_AddChunk: None,
-        PJRT_CopyToDeviceStream_TotalBytes: None,
-        PJRT_CopyToDeviceStream_GranuleSize: None,
-        PJRT_CopyToDeviceStream_CurrentBytes: None,
+        PJRT_CopyToDeviceStream_Destroy: Some(CopyToDeviceStreamDestroy),
+        PJRT_CopyToDeviceStream_AddChunk: Some(CopyToDeviceStreamAddChunk),
+        PJRT_CopyToDeviceStream_TotalBytes: Some(CopyToDeviceStreamTotalBytes),
+        PJRT_CopyToDeviceStream_GranuleSize: Some(CopyToDeviceStreamGranuleSize),
+        PJRT_CopyToDeviceStream_CurrentBytes: Some(CopyToDeviceStreamCurrentBytes),
         PJRT_TopologyDescription_Create: Some(TopologyDescriptionCreate),
         PJRT_TopologyDescription_Destroy: Some(TopologyDescriptionDestroy),
         PJRT_TopologyDescription_PlatformName: Some(TopologyPlatformName),

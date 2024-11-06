@@ -3,6 +3,9 @@ import jax
 import jax._src.xla_bridge as xb
 import jax.numpy as jnp
 
+import faulthandler
+faulthandler.enable()
+
 
 def initialize():
     path = os.path.join(os.path.dirname(__file__), 'target/debug/libpjrt_coreml.dylib')
