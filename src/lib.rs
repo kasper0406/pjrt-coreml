@@ -16,6 +16,10 @@ use std::ffi::CString;
 use std::ptr;
 use std::sync::RwLock;
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::alloc::{alloc, dealloc, Layout};
+use uuid::Uuid;
 
 use sysinfo::System;
 
@@ -32,8 +36,12 @@ struct Memory {
     kind: CString,
 }
 
+#[derive(Debug)]
 struct Executable {
+    pjrt_executable: PJRT_Executable,
+
     memory_kinds: Vec<CString>,
+    fingerprint: CString,
 
     // C pointers
     memory_kinds_ptr: Vec<*const i8>,
@@ -42,7 +50,8 @@ struct Executable {
 
 impl Executable {
     fn new() -> Self {
-        let memory_kinds = vec![CString::new("CoreML").unwrap()];
+        // TODO(knielsen): Fix these memory_kinds to line up with COREML_MEMORYS
+        let memory_kinds = vec![CString::new("CoreML Unified Memory").unwrap()];
         let memory_kinds_ptr: Vec<*const i8> = memory_kinds.iter()
             .map(|memory_kind| memory_kind.as_ptr())
             .collect();
@@ -51,9 +60,62 @@ impl Executable {
             .collect();
 
         Executable {
+            pjrt_executable: PJRT_Executable{ _unused: [0; 0] },
+            // TODO(knielsen): Implement proper fingerprinting!
+            fingerprint: CString::new(Uuid::new_v4().to_string()).unwrap(),
             memory_kinds,
             memory_kinds_ptr,
             memory_kinds_sizes,
+        }
+    }
+}
+
+struct LoadedExecutable {
+    pjrt_loaded_executable: PJRT_LoadedExecutable,
+
+    executable: Executable,
+}
+
+impl LoadedExecutable {
+    fn new(executable: Executable) -> Self {
+        LoadedExecutable {
+            pjrt_loaded_executable: PJRT_LoadedExecutable { _unused: [0; 0] },
+            executable,
+        }
+    }
+}
+
+struct Buffer {
+    pjrt_buffer: PJRT_Buffer,
+
+    // TODO(knielsen): Change this to be a proper numpy buffer
+    bytes: Vec<f32>,
+}
+
+impl Buffer {
+    fn new() -> Self {
+        Buffer {
+            pjrt_buffer: PJRT_Buffer { _unused: [0; 0] },
+            bytes: vec![1.0, 2.0, 2.5, 3.0],
+        }
+    }
+}
+
+struct EventCallback {
+    callback: PJRT_Event_OnReadyCallback,
+    user_arg: *const c_void,
+}
+
+struct Event {
+    event: PJRT_Event,
+    callback: Option<EventCallback>,
+}
+
+impl Event {
+    fn new() -> Self {
+        Event {
+            event: PJRT_Event { _unused: [0; 0] },
+            callback: None,
         }
     }
 }
@@ -90,13 +152,12 @@ lazy_static! {
 
     static ref PLATFORM_NAME: CString = CString::new("CoreML").unwrap();
     static ref VERSION: CString = CString::new("0.0.0").unwrap();
-
-    static ref TEST_EXECUTABLE: Executable = Executable::new();
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PluginInitialize(arg_ptr: *mut PJRT_Plugin_Initialize_Args) -> *mut PJRT_Error {
     println!("PluginInitialize was called...");
+
     ptr::null_mut()
 }
 
@@ -105,6 +166,43 @@ pub unsafe extern "C" fn PluginAttributes(arg_ptr: *mut PJRT_Plugin_Attributes_A
     println!("PluginAttributes was called...");
 
     (*arg_ptr).num_attributes = 0;
+
+    ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn EventDestroy(arg_ptr: *mut PJRT_Event_Destroy_Args) -> *mut PJRT_Error {
+    todo!("EventDestroy was called...")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn EventIsReady(arg_ptr: *mut PJRT_Event_IsReady_Args) -> *mut PJRT_Error {
+    todo!("EventIsReady was called...")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn EventError(arg_ptr: *mut PJRT_Event_Error_Args) -> *mut PJRT_Error {
+    todo!("EventError was called...")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn EventAwait(arg_ptr: *mut PJRT_Event_Await_Args) -> *mut PJRT_Error {
+    todo!("EventAwait was called...")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn EventOnReady(arg_ptr: *mut PJRT_Event_OnReady_Args) -> *mut PJRT_Error {
+    println!("EventOnReady was called...");
+
+    let event_ptr = (*arg_ptr).event as *mut Event;
+    // TODO(knielsen): Think about concurrency...
+    if (*event_ptr).callback.is_some() {
+        todo!("Handle the case of multiple registered callbacks");
+    }
+    (*event_ptr).callback = Some(EventCallback {
+        callback: (*arg_ptr).callback,
+        user_arg: (*arg_ptr).user_arg,
+    });
 
     ptr::null_mut()
 }
@@ -273,11 +371,8 @@ pub unsafe extern "C" fn ClientAddressableMemories(arg_ptr: *mut PJRT_Client_Add
 pub unsafe extern "C" fn ClientCompile(arg_ptr: *mut PJRT_Client_Compile_Args) -> *mut PJRT_Error {
     println!("ClientCompile was called...");
 
-    let executable = Box::new(PJRT_LoadedExecutable {
-        _unused: [0; 0],
-    });
-
-    (*arg_ptr).executable = Box::into_raw(executable);
+    let executable = Box::new(LoadedExecutable::new(Executable::new()));
+    (*arg_ptr).executable = Box::into_raw(executable) as *mut PJRT_LoadedExecutable;
 
     ptr::null_mut()
 }
@@ -286,11 +381,9 @@ pub unsafe extern "C" fn ClientCompile(arg_ptr: *mut PJRT_Client_Compile_Args) -
 pub unsafe extern "C" fn LoadedExecutableGetExecutable(arg_ptr: *mut PJRT_LoadedExecutable_GetExecutable_Args) -> *mut PJRT_Error {
     println!("LoadedExecutableGetExecutable was called...");
 
-    let executable = Box::new(PJRT_Executable {
-        _unused: [0; 0],
-    });
-
-    (*arg_ptr).executable = Box::into_raw(executable);
+    let loaded_executable_ptr = (*arg_ptr).loaded_executable as *mut LoadedExecutable;
+    (*arg_ptr).executable = ptr::addr_of_mut!((*loaded_executable_ptr).executable) as *mut PJRT_Executable;
+    println!("Sending back executable: {:?}", *arg_ptr);
 
     ptr::null_mut()
 }
@@ -301,6 +394,18 @@ pub unsafe extern "C" fn DeviceAddressableMemories(arg_ptr: *mut PJRT_Device_Add
 
     (*arg_ptr).num_memories = COREML_MEMORYS.len();
     (*arg_ptr).memories = COREML_MEMORYS_POINTERS.as_ptr();
+
+    ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PJRT_Executable_Fingerprint(arg_ptr: *mut PJRT_Executable_Fingerprint_Args) -> *mut PJRT_Error {
+    println!("PJRT_Executable_Fingerprint was called...");
+
+    let executable_ptr = (*arg_ptr).executable as *mut Executable;
+
+    (*arg_ptr).executable_fingerprint_size = (*executable_ptr).fingerprint.count_bytes();
+    (*arg_ptr).executable_fingerprint = (*executable_ptr).fingerprint.as_ptr();
 
     ptr::null_mut()
 }
@@ -397,7 +502,16 @@ pub unsafe extern "C" fn MemoryAddressableByDevices(arg_ptr: *mut PJRT_Memory_Ad
 
 #[no_mangle]
 pub unsafe extern "C" fn ExecutableDestroy(arg_ptr: *mut PJRT_Executable_Destroy_Args) -> *mut PJRT_Error {
-    todo!("Implement ExecutableDestroy")
+    println!("ExecutableDestroy was called...");
+
+    // TODO(knielsen): Consider if this is ok?
+    // We keep the executable around for as long as the LoadedExecutable is alive
+
+    // let executable_ptr = (*arg_ptr).executable as *mut Executable;
+    // let executable = Box::from_raw(executable_ptr);
+    // drop(executable);
+
+    ptr::null_mut()
 }
 
 #[no_mangle]
@@ -417,7 +531,12 @@ pub unsafe extern "C" fn ExecutableNumPartitions(arg_ptr: *mut PJRT_Executable_N
 
 #[no_mangle]
 pub unsafe extern "C" fn ExecutableNumOutputs(arg_ptr: *mut PJRT_Executable_NumOutputs_Args) -> *mut PJRT_Error {
-    todo!("Implement ExecutableNumOutputs")
+    println!("ExecutableNumOutputs was called...");
+
+    let executable_ptr = (*arg_ptr).executable as *mut Executable;
+    (*arg_ptr).num_outputs = (*executable_ptr).memory_kinds.len();
+
+    ptr::null_mut()
 }
 
 #[no_mangle]
@@ -434,16 +553,11 @@ pub unsafe extern "C" fn ExecutableGetCostAnalysis(arg_ptr: *mut PJRT_Executable
 pub unsafe extern "C" fn ExecutableOutputMemoryKinds(arg_ptr: *mut PJRT_Executable_OutputMemoryKinds_Args) -> *mut PJRT_Error {
     println!("ExecutableOutputMemoryKinds was called");
 
-    for i in 0..(*arg_ptr).num_outputs {
-        let sizes_ptr = (*arg_ptr).memory_kind_sizes.add(i) as *mut usize;
-        let memory_kind_ptr = (*arg_ptr).memory_kinds.add(i) as *mut *const i8;
+    let executable_ptr = (*arg_ptr).executable as *mut Executable;
 
-        println!("Sizes ptr: {:?} - {:?}", sizes_ptr, (*arg_ptr).memory_kind_sizes);
-        println!("Memory kind ptr: {:?} - {:?}", memory_kind_ptr, (*arg_ptr).memory_kinds);
-
-        *sizes_ptr = PLATFORM_NAME.count_bytes();
-        *memory_kind_ptr = PLATFORM_NAME.as_ptr();
-    }
+    (*arg_ptr).num_outputs = (*executable_ptr).memory_kinds.len();
+    (*arg_ptr).memory_kind_sizes = (*executable_ptr).memory_kinds_sizes.as_ptr();
+    (*arg_ptr).memory_kinds = (*executable_ptr).memory_kinds_ptr.as_ptr();
 
     ptr::null_mut()
 }
@@ -474,7 +588,13 @@ pub unsafe extern "C" fn ExecutableSerialize(arg_ptr: *mut PJRT_Executable_Seria
 
 #[no_mangle]
 pub unsafe extern "C" fn LoadedExecutableDestroy(arg_ptr: *mut PJRT_LoadedExecutable_Destroy_Args) -> *mut PJRT_Error {
-    todo!("Implement LoadedExecutableDestroy")
+    println!("LoadedExecutableDestroy was called...");
+
+    let loaded_executable_ptr = (*arg_ptr).executable as *mut LoadedExecutable;
+    let loaded_executable = Box::from_raw(loaded_executable_ptr);
+    drop(loaded_executable);
+
+    ptr::null_mut()
 }
 
 #[no_mangle]
@@ -499,7 +619,31 @@ pub unsafe extern "C" fn LoadedExecutableIsDeleted(arg_ptr: *mut PJRT_LoadedExec
 
 #[no_mangle]
 pub unsafe extern "C" fn LoadedExecutableExecute(arg_ptr: *mut PJRT_LoadedExecutable_Execute_Args) -> *mut PJRT_Error {
-    todo!("Implement LoadedExecutableExecute")
+    println!("LoadedExecutableExecute was called...");
+
+    // TODO(knielsen): Implement actual execution...
+
+    let loaded_executable_ptr = (*arg_ptr).executable as *mut LoadedExecutable;
+    let num_outputs = (*loaded_executable_ptr).executable.memory_kinds.len();
+
+    if (*arg_ptr).num_devices != 1 {
+        panic!("There should be exactly 1 CoreML device!");
+    }
+
+    for output_idx in 0..num_outputs {
+        let buffer = Box::new(Buffer::new());
+
+        let device_outputs = *(*arg_ptr).output_lists;
+        *device_outputs.add(output_idx) = Box::into_raw(buffer) as *mut PJRT_Buffer;
+    }
+
+    if !(*arg_ptr).device_complete_events.is_null() {
+        let event = Box::new(Event::new());
+        let events_ptr = (*arg_ptr).device_complete_events;
+        *events_ptr = Box::into_raw(event) as *mut PJRT_Event;
+    }
+
+    ptr::null_mut()
 }
 
 #[no_mangle]
@@ -510,6 +654,105 @@ pub unsafe extern "C" fn ExecutableDeserializeAndLoad(arg_ptr: *mut PJRT_Executa
 #[no_mangle]
 pub unsafe extern "C" fn LoadedExecutableFingerprint(arg_ptr: *mut PJRT_LoadedExecutable_Fingerprint_Args) -> *mut PJRT_Error {
     todo!("Implement LoadedExecutableFingerprint")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BufferDestroy(arg_ptr: *mut PJRT_Buffer_Destroy_Args) -> *mut PJRT_Error {
+    println!("BufferDestroy was called...");
+
+    let buffer_ptr = (*arg_ptr).buffer as *mut Buffer;
+    let buffer = Box::from_raw(buffer_ptr);
+    drop(buffer);
+
+    ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BufferElementType(arg_ptr: *mut PJRT_Buffer_ElementType_Args) -> *mut PJRT_Error {
+    println!("BufferElementType was called...");
+
+    // TODO(knielsen): Make a proper implementation of this
+    (*arg_ptr).type_ = PJRT_Buffer_Type_PJRT_Buffer_Type_F32;
+
+    ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BufferDimensions(arg_ptr: *mut PJRT_Buffer_Dimensions_Args) -> *mut PJRT_Error {
+    todo!("Implement BufferDimensions")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BufferMemoryLayout(arg_ptr: *mut PJRT_Buffer_GetMemoryLayout_Args) -> *mut PJRT_Error {
+    todo!("Implement BufferMemoryLayout")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BufferDeviceSizeInBytes(arg_ptr: *mut PJRT_Buffer_OnDeviceSizeInBytes_Args) -> *mut PJRT_Error {
+    todo!("Implement BufferDeviceSizeInBytes")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BufferDevice(arg_ptr: *mut PJRT_Buffer_Device_Args) -> *mut PJRT_Error {
+    println!("BufferDevice was called...");
+
+    (*arg_ptr).device = COREML_DEVICES_POINTERS[0];
+
+    ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BufferMemory(arg_ptr: *mut PJRT_Buffer_Memory_Args) -> *mut PJRT_Error {
+    println!("BufferMemory was called...");
+
+    (*arg_ptr).memory = COREML_MEMORYS_POINTERS[0];
+
+    ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BufferIsDeleted(arg_ptr: *mut PJRT_Buffer_IsDeleted_Args) -> *mut PJRT_Error {
+    println!("BufferIsDeleted was called...");
+
+    // TODO(knielsen): Support deletion...
+    (*arg_ptr).is_deleted = false;
+
+    ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BufferCopyToDevice(arg_ptr: *mut PJRT_Buffer_CopyToDevice_Args) -> *mut PJRT_Error {
+    todo!("Implement BufferCopyToDevice")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BufferToHostBuffer(arg_ptr: *mut PJRT_Buffer_ToHostBuffer_Args) -> *mut PJRT_Error {
+    todo!("Implement BufferToHostBuffer")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BufferIsOnCpu(arg_ptr: *mut PJRT_Buffer_IsOnCpu_Args) -> *mut PJRT_Error {
+    todo!("Implement BufferIsOnCpu")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BufferReadyEvent(arg_ptr: *mut PJRT_Buffer_ReadyEvent_Args) -> *mut PJRT_Error {
+    todo!("Implement BufferReadyEvent")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BufferUnsafePointer(arg_ptr: *mut PJRT_Buffer_UnsafePointer_Args) -> *mut PJRT_Error {
+    todo!("Implement BufferUnsafePointer")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BufferIncreaseRefCount(arg_ptr: *mut PJRT_Buffer_IncreaseExternalReferenceCount_Args) -> *mut PJRT_Error {
+    todo!("Implement BufferIncreaseRefCount")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BufferDecreaseRefCount(arg_ptr: *mut PJRT_Buffer_DecreaseExternalReferenceCount_Args) -> *mut PJRT_Error {
+    todo!("Implement BufferDecreaseRefCount")
 }
 
 #[no_mangle]
@@ -613,11 +856,11 @@ pub unsafe extern "C" fn GetPjrtApi() -> *mut PJRT_Api {
         PJRT_Error_GetCode: None,
         PJRT_Plugin_Initialize: Some(PluginInitialize),
         PJRT_Plugin_Attributes: Some(PluginAttributes),
-        PJRT_Event_Destroy: None,
-        PJRT_Event_IsReady: None,
-        PJRT_Event_Error: None,
-        PJRT_Event_Await: None,
-        PJRT_Event_OnReady: None,
+        PJRT_Event_Destroy: Some(EventDestroy),
+        PJRT_Event_IsReady: Some(EventIsReady),
+        PJRT_Event_Error: Some(EventError),
+        PJRT_Event_Await: Some(EventAwait),
+        PJRT_Event_OnReady: Some(EventOnReady),
         PJRT_Client_Create: Some(ClientCreate),
         PJRT_Client_Destroy: Some(ClientDestroy),
         PJRT_Client_PlatformName: Some(ClientPlatformName),
@@ -666,24 +909,24 @@ pub unsafe extern "C" fn GetPjrtApi() -> *mut PJRT_Api {
         PJRT_LoadedExecutable_Execute: Some(LoadedExecutableExecute),
         PJRT_Executable_DeserializeAndLoad: Some(ExecutableDeserializeAndLoad),
         PJRT_LoadedExecutable_Fingerprint: Some(LoadedExecutableFingerprint),
-        PJRT_Buffer_Destroy: None,
-        PJRT_Buffer_ElementType: None,
-        PJRT_Buffer_Dimensions: None,
+        PJRT_Buffer_Destroy: Some(BufferDestroy),
+        PJRT_Buffer_ElementType: Some(BufferElementType),
+        PJRT_Buffer_Dimensions: Some(BufferDimensions),
         PJRT_Buffer_UnpaddedDimensions: None,
         PJRT_Buffer_DynamicDimensionIndices: None,
-        PJRT_Buffer_GetMemoryLayout: None,
-        PJRT_Buffer_OnDeviceSizeInBytes: None,
-        PJRT_Buffer_Device: None,
-        PJRT_Buffer_Memory: None,
+        PJRT_Buffer_GetMemoryLayout: Some(BufferMemoryLayout),
+        PJRT_Buffer_OnDeviceSizeInBytes: Some(BufferDeviceSizeInBytes),
+        PJRT_Buffer_Device: Some(BufferDevice),
+        PJRT_Buffer_Memory: Some(BufferMemory),
         PJRT_Buffer_Delete: None,
-        PJRT_Buffer_IsDeleted: None,
-        PJRT_Buffer_CopyToDevice: None,
-        PJRT_Buffer_ToHostBuffer: None,
-        PJRT_Buffer_IsOnCpu: None,
-        PJRT_Buffer_ReadyEvent: None,
-        PJRT_Buffer_UnsafePointer: None,
-        PJRT_Buffer_IncreaseExternalReferenceCount: None,
-        PJRT_Buffer_DecreaseExternalReferenceCount: None,
+        PJRT_Buffer_IsDeleted: Some(BufferIsDeleted),
+        PJRT_Buffer_CopyToDevice: Some(BufferCopyToDevice),
+        PJRT_Buffer_ToHostBuffer: Some(BufferToHostBuffer),
+        PJRT_Buffer_IsOnCpu: Some(BufferIsOnCpu),
+        PJRT_Buffer_ReadyEvent: Some(BufferReadyEvent),
+        PJRT_Buffer_UnsafePointer: Some(BufferUnsafePointer),
+        PJRT_Buffer_IncreaseExternalReferenceCount: Some(BufferIncreaseRefCount),
+        PJRT_Buffer_DecreaseExternalReferenceCount: Some(BufferDecreaseRefCount),
         PJRT_Buffer_OpaqueDeviceMemoryDataPointer: None,
         PJRT_CopyToDeviceStream_Destroy: None,
         PJRT_CopyToDeviceStream_AddChunk: None,
@@ -702,7 +945,7 @@ pub unsafe extern "C" fn GetPjrtApi() -> *mut PJRT_Api {
         PJRT_Executable_OutputDimensions: None,
         PJRT_Buffer_CopyToMemory: None,
         PJRT_Client_CreateViewOfDeviceBuffer: None,
-        PJRT_Executable_Fingerprint: None,
+        PJRT_Executable_Fingerprint: Some(PJRT_Executable_Fingerprint),
         PJRT_Client_TopologyDescription: Some(PJRT_Client_TopologyDescription),
         PJRT_Executable_GetCompiledMemoryStats: None,
         PJRT_Memory_Kind_Id: Some(PJRT_MemoryKindId),

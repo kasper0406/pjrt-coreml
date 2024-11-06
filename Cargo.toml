@@ -10,5 +10,13 @@ crate-type = ["dylib"]
 lazy_static = "1"
 sysinfo = "0.32"
 
+[dependencies.uuid]
+version = "1.11.0"
+features = [
+    "v4",                # Lets you generate random UUIDs
+    "fast-rng",          # Use a faster (but still sufficiently random) RNG
+    "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
+]
+
 [build-dependencies]
 bindgen = "0.65"

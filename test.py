@@ -14,4 +14,5 @@ jax.config.update("jax_platforms", "pjrt-coreml")
 
 # jnp.add(1, 2)
 
-jnp.arange(10)
+foo = jnp.arange(10)
+print(foo)
