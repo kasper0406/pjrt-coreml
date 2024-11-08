@@ -3,12 +3,13 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
-
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 
 #[macro_use]
 extern crate lazy_static;
+
+mod coreml;
 
 use std::ffi::c_void;
 use std::os::raw::c_int;
@@ -30,16 +31,7 @@ use sysinfo::System;
 
 use log::{debug, info, warn};
 
-use autocxx::prelude::*;
-
-include_cpp! {
-    #include "swift/Bridge.hpp"
-    safety!(unsafe_ffi)
-    generate!("swift_coreml::TensorDescription")
-    generate!("swift_coreml::mltensor_create")
-    generate!("swift_coreml::mltensor_destroy")
-}
-
+use coreml::CoreMLBuffer;
 
 
 static mut COREML_DEVICES_POINTERS: Vec<*mut PJRT_Device> = vec![];
@@ -126,25 +118,29 @@ struct Buffer {
     pjrt_buffer: PJRT_Buffer,
     ref_count: usize,
 
-    tensor: Option<UniquePtr<ffi::swift_coreml::TensorDescription>>,
+    buffer: Option<CoreMLBuffer>,
 
     // Buffered fields to provide to the C API
     dims: Vec<i64>,
 }
 
 impl Buffer {
-    fn new(maybe_tensor: Option<UniquePtr<ffi::swift_coreml::TensorDescription>>) -> Self {
-        let dims = match maybe_tensor {
-            Some(tensor) => tensor.getShape().within_unique_ptr(),
+    fn new(mut maybe_buffer: Option<CoreMLBuffer>) -> Self {
+        let dims = match maybe_buffer {
+            Some(ref mut tensor) => tensor.shape(),
             None => vec![],
         };
 
         Buffer {
             pjrt_buffer: PJRT_Buffer { _unused: [0; 0] },
             ref_count: 0,
-            tensor: maybe_tensor,
+            buffer: maybe_buffer,
             dims,
         }
+    }
+
+    pub fn raw_data_pointer(&mut self) -> Option<*mut c_void> {
+        self.buffer.as_mut().map(|mut buffer| buffer.raw_data_pointer())
     }
 }
 
@@ -785,7 +781,8 @@ pub unsafe extern "C" fn LoadedExecutableExecute(arg_ptr: *mut PJRT_LoadedExecut
     }
 
     for output_idx in 0..num_outputs {
-        let buffer = Box::new(Buffer::new(None));
+        let coreml_buffer = CoreMLBuffer::new();
+        let buffer = Box::new(Buffer::new(Some(coreml_buffer)));
 
         let device_outputs = *(*arg_ptr).output_lists;
         *device_outputs.add(output_idx) = Box::into_raw(buffer) as *mut PJRT_Buffer;
@@ -821,10 +818,6 @@ pub unsafe extern "C" fn BufferDestroy(arg_ptr: *mut PJRT_Buffer_Destroy_Args) -
 
     let buffer_ptr = (*arg_ptr).buffer as *mut Buffer;
     let buffer = Box::from_raw(buffer_ptr);
-    if let Some(mltensor) = &buffer.tensor {
-        debug!("Freeing CoreML tensor");
-        ffi::swift_coreml::mltensor_destroy(&mltensor);
-    }
     drop(buffer);
 
     ptr::null_mut()
@@ -979,9 +972,8 @@ pub unsafe extern "C" fn BufferDecreaseRefCount(arg_ptr: *mut PJRT_Buffer_Decrea
 pub unsafe extern "C" fn BufferOpaqueDeviceMemoryDataPointer(arg_ptr: *mut PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args) -> *mut PJRT_Error {
     info!("BufferDecreaseRefCount was called...");
 
-    let buffer_ptr = (*arg_ptr).buffer as *mut Buffer;
-    let data_ptr = (*buffer_ptr).data.as_ptr();
-    (*arg_ptr).device_memory_ptr = data_ptr as *mut c_void;
+    let mut buffer_ptr = (*arg_ptr).buffer as *mut Buffer;
+    (*arg_ptr).device_memory_ptr = (*buffer_ptr).raw_data_pointer().unwrap();
 
     ptr::null_mut()
 }
@@ -995,9 +987,8 @@ pub unsafe extern "C" fn BufferCopyToMemory(arg_ptr: *mut PJRT_Buffer_CopyToMemo
 pub unsafe extern "C" fn ClientBufferFromHostBuffer(arg_ptr: *mut PJRT_Client_BufferFromHostBuffer_Args) -> *mut PJRT_Error {
     info!("ClientBufferFromHostBuffer was called");
 
-    debug!("Allocating MLTensor in Swift");
-    let tensor = ffi::swift_coreml::mltensor_create().within_unique_ptr();
-    let buffer = Box::new(Buffer::new(Some(tensor)));
+    let coreml_buffer = CoreMLBuffer::new();
+    let buffer = Box::new(Buffer::new(Some(coreml_buffer)));
 
     (*arg_ptr).buffer = Box::into_raw(buffer) as *mut PJRT_Buffer;
 

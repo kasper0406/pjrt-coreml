@@ -19,14 +19,13 @@ fn main() {
     println!("cargo::rustc-link-search=/Volumes/git/ml/pjrt-coreml/swift/");
     println!("cargo::rustc-link-search=/usr/lib/swift/");
     println!("cargo::rustc-link-lib=static=swift_coreml");
-    // println!("cargo::rustc-link-lib=swiftCxx");
-    // println!("cargo::rustc-link-lib=swiftCxxStdlib");
-    // println!("cargo::rustc-cdylib-link-arg=-Wl,-rpath,@loader_path/../Frameworks");
+    println!("cargo::rustc-link-lib=swiftCore");
 
     // Swift bindings
     let path = std::path::PathBuf::from(".");
-    let mut b = autocxx_build::Builder::new("src/lib.rs", &[&path]).build().unwrap();
+    let mut b = autocxx_build::Builder::new("src/coreml.rs", &[&path]).build().unwrap();
     b.flag_if_supported("-std=c++20").compile("autocxx_swift_coreml");
 
     println!("cargo:rerun-if-changed=src/lib.rs");
+    println!("cargo:rerun-if-changed=src/coreml.rs");
 }
