@@ -12,6 +12,8 @@ sysinfo = "0.32"
 async-std = "1.13"
 log = "0.4"
 env_logger = "0.11"
+cxx = "1.0"
+autocxx = "0.27"
 
 [dependencies.uuid]
 version = "1.11.0"
@@ -22,4 +24,6 @@ features = [
 ]
 
 [build-dependencies]
-bindgen = "0.65"
+bindgen = "0.69"
+cxx-build = "1.0"
+autocxx-build = "0.27.0"
