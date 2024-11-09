@@ -11,6 +11,7 @@ extern crate lazy_static;
 
 mod coreml;
 
+use core::slice;
 use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::ffi::CString;
@@ -130,6 +131,7 @@ impl Buffer {
             Some(ref mut tensor) => tensor.shape(),
             None => vec![],
         };
+        debug!["Created buffer with shape: {:?}", dims];
 
         Buffer {
             pjrt_buffer: PJRT_Buffer { _unused: [0; 0] },
@@ -781,7 +783,12 @@ pub unsafe extern "C" fn LoadedExecutableExecute(arg_ptr: *mut PJRT_LoadedExecut
     }
 
     for output_idx in 0..num_outputs {
-        let coreml_buffer = CoreMLBuffer::new();
+        // TODO(knielsen): Get this information from the program. For now just make up something...
+        let elementType = coreml::ElementType::F16;
+        let shape = vec![3, 2];
+        let strides = vec![2, 1];
+
+        let coreml_buffer = coreml::CoreMLBuffer::allocate_shape(elementType, shape, strides);
         let buffer = Box::new(Buffer::new(Some(coreml_buffer)));
 
         let device_outputs = *(*arg_ptr).output_lists;
@@ -986,8 +993,47 @@ pub unsafe extern "C" fn BufferCopyToMemory(arg_ptr: *mut PJRT_Buffer_CopyToMemo
 #[no_mangle]
 pub unsafe extern "C" fn ClientBufferFromHostBuffer(arg_ptr: *mut PJRT_Client_BufferFromHostBuffer_Args) -> *mut PJRT_Error {
     info!("ClientBufferFromHostBuffer was called");
+    
+    // Compute shape
+    let shape = unsafe { slice::from_raw_parts((*arg_ptr).dims, (*arg_ptr).num_dims) };
+    info!["Shape: {:?}", shape];
 
-    let coreml_buffer = CoreMLBuffer::new();
+    // Compute strides
+    let mut strides = vec![];
+    if (*arg_ptr).device_layout.is_null() {
+        // Major-to-minor order
+        strides.push(1);
+        for (axis, dimension) in shape.iter().skip(1).rev().enumerate() {
+            strides.push(dimension * strides[axis]);
+        }
+        info!["Calculated strides: {:?}", strides];
+    } else {
+        let device_layout = *(*arg_ptr).device_layout;
+        match device_layout.type_ {
+            PJRT_Buffer_MemoryLayout_Type_PJRT_Buffer_MemoryLayout_Type_Tiled => {
+                todo!("Implement tiled buffers")
+            },
+            PJRT_Buffer_MemoryLayout_Type_PJRT_Buffer_MemoryLayout_Type_Strides => {
+                let num_strides = device_layout.__bindgen_anon_1.strides.num_byte_strides;
+                todo!("Strided!")
+            },
+            _ => todo!("Unexpected memory layout!"),
+        }
+    }
+
+    // Compute element type
+    let element_type = match (*arg_ptr).type_ {
+        PJRT_Buffer_Type_PJRT_Buffer_Type_F16 => coreml::ElementType::F16,
+        PJRT_Buffer_Type_PJRT_Buffer_Type_F32 => coreml::ElementType::F32,
+        PJRT_Buffer_Type_PJRT_Buffer_Type_F64 => coreml::ElementType::F64,
+        PJRT_Buffer_Type_PJRT_Buffer_Type_S32 => coreml::ElementType::I32,
+        unsupported_type => todo!("Type not yet supported: {:?}", unsupported_type)
+    };
+
+    let numBytes = (shape.iter().product::<i64>() as usize) * element_type.width();
+    let data = unsafe { slice::from_raw_parts((*arg_ptr).data as *const u8, numBytes) };
+
+    let coreml_buffer = CoreMLBuffer::allocate_from_data(data, element_type, shape, &strides);
     let buffer = Box::new(Buffer::new(Some(coreml_buffer)));
 
     (*arg_ptr).buffer = Box::into_raw(buffer) as *mut PJRT_Buffer;
