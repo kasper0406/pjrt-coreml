@@ -3,16 +3,24 @@ use pyo3::types::IntoPyDict;
 use pyo3::types::PyDict;
 use pyo3::types::PyBytes;
 
+use tempfile::TempDir;
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+
 use log::{debug, info, warn};
 
+#[derive(Debug)]
 pub struct CoreMLModel {
-    bytes: Vec<u8>,
+    directory: TempDir,
+    filename: String,
 }
 
-pub fn stablehlo_to_coreml(mlir_module: &[u8]) -> CoreMLModel {
+pub fn stablehlo_to_coreml(mlir_module: &[u8]) -> Result<CoreMLModel, ()> {
     debug!["Attempting to call Python!"];
 
-    let foo: Result<(), pyo3::PyErr> = Python::with_gil(|py| {
+    let model_result: Result<CoreMLModel, pyo3::PyErr> = Python::with_gil(|py| {
+        // Construct the MLIR module
         let jax_mlir = py.import_bound("jax._src.interpreters.mlir")?;
         let mlir = py.import_bound("jax._src.lib.mlir")?;
         let ir = mlir.getattr("ir")?;
@@ -33,19 +41,38 @@ pub fn stablehlo_to_coreml(mlir_module: &[u8]) -> CoreMLModel {
         let kwargs = PyDict::new_bound(py);
         kwargs.set_item("context", mlir_context)?;
 
-        // let locals = [("mlir_module", &mlir_module_bytes)].into_py_dict_bound(py);
-        // let code = "print(f\"Processing mlir_module with type {type(mlir_module)}: {mlir_module}\")";
-        // let coreml_bytes: Vec<u8> = py.eval_bound(code, None, Some(&locals))?.extract()?;
-        // let coreml_bytes: Vec<u8> = py.eval_bound(code, None, None)?.extract()?;
-        // info!["Got CoreML binary data: {:?}", coreml_bytes];
+        let hlo_module = module_parse.call((stablehlo_bytes, ), Some(&kwargs))?;
+        debug!["Contstructed module {:?}", hlo_module];
 
-        let module = module_parse.call((stablehlo_bytes, ), Some(&kwargs))?;
+        // Convert to MIL
+        let stablehlo_coreml = py.import_bound("stablehlo_coreml")?;
+        let ct = py.import_bound("coremltools")?;
+        let mil_converter = stablehlo_coreml.getattr("convert")?;
+        let target_macos15 = ct.getattr("target")?.getattr("macOS15")?;
+        let mil_program = mil_converter.call((hlo_module, &target_macos15), None)?;
+        debug!["Constructed MIL program: {:?}", mil_program];
 
-        info!["Contstructed module {:?}", module];
+        // Convert to CoreML
+        let empty_pipeline = ct.getattr("PassPipeline")?.getattr("EMPTY")?;
+        let coreml_converter = ct.getattr("convert")?;
+        let kwargs = PyDict::new_bound(py);
+        kwargs.set_item("source", "milinternal")?;
+        kwargs.set_item("minimum_deployment_target", &target_macos15)?;
+        kwargs.set_item("pass_pipeline", empty_pipeline)?;
+        let coreml_model = coreml_converter.call((mil_program, ), Some(&kwargs))?;
+        debug!["Constructed CoreML model: {:?}", coreml_model];
 
-        Ok(())
+        // Save the model to a directory so it  can be loaded later in Swift for prediction
+        // TODO(knielsen): Consider getting rid of this step and just doing things through Python?
+        let coreml_model_dir = TempDir::new()?;
+        let model_filename = "cml.mlpackage";
+        let coreml_model_file = coreml_model_dir.path().join(model_filename);
+        coreml_model.getattr("save")?.call((coreml_model_file, ), None)?;
+
+        Ok(CoreMLModel { directory: coreml_model_dir, filename: String::from(model_filename) })
     });
-    info!("Result of constructing CoreML model: {:?}", foo);
- 
-    CoreMLModel { bytes: vec![] }
+    info!("Result of constructing CoreML model: {:?}", &model_result);
+
+    // TODO(knielsen): Add a proper error return!
+    model_result.map_err(|err| ())
 }

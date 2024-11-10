@@ -14,6 +14,7 @@ log = "0.4"
 env_logger = "0.11"
 cxx = "1.0.129"
 autocxx = "0.27"
+tempfile = "3"
 
 [dependencies.uuid]
 version = "1.11.0"
