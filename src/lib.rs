@@ -10,6 +10,7 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 extern crate lazy_static;
 
 mod coreml;
+mod py_translate;
 
 use core::slice;
 use std::ffi::c_void;
@@ -497,6 +498,14 @@ pub unsafe extern "C" fn ClientAddressableMemories(arg_ptr: *mut PJRT_Client_Add
 #[no_mangle]
 pub unsafe extern "C" fn ClientCompile(arg_ptr: *mut PJRT_Client_Compile_Args) -> *mut PJRT_Error {
     info!("ClientCompile was called...");
+
+    // TODO(knielsen): Check the program format?
+    let program_ptr: *const PJRT_Program = (*arg_ptr).program;
+    let format= unsafe { slice::from_raw_parts((*program_ptr).format as *const u8, (*program_ptr).format_size) };
+    debug!["Compiling program with format {:?}", format];
+
+    let mlir_module= unsafe { slice::from_raw_parts((*program_ptr).code as *const u8, (*program_ptr).code_size) };
+    let coreml_model = py_translate::stablehlo_to_coreml(mlir_module);
 
     let executable = Box::new(LoadedExecutable::new(Executable::new()));
     (*arg_ptr).executable = Box::into_raw(executable) as *mut PJRT_LoadedExecutable;

@@ -23,6 +23,10 @@ features = [
     "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
 ]
 
+[dependencies.pyo3]
+version = "0.22"
+features = ["auto-initialize"]
+
 [build-dependencies]
 bindgen = "0.69"
 # cxx-build = "1.0"
