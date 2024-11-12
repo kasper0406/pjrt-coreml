@@ -1,4 +1,4 @@
-#![feature(vec_into_raw_parts, box_as_ptr, async_closure)]
+#![feature(vec_into_raw_parts, box_as_ptr, async_closure, f16)]
 
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
@@ -10,7 +10,6 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 extern crate lazy_static;
 
 mod coreml;
-mod py_translate;
 
 use core::slice;
 use std::ffi::c_void;
@@ -32,8 +31,6 @@ use std::sync::{Arc, Mutex};
 use sysinfo::System;
 
 use log::{debug, info, warn};
-
-use coreml::CoreMLBuffer;
 
 
 static mut COREML_DEVICES_POINTERS: Vec<*mut PJRT_Device> = vec![];
@@ -73,6 +70,7 @@ struct Executable {
 
     memory_kinds: Vec<CString>,
     fingerprint: CString,
+    model: coreml::Model,
 
     // C pointers
     memory_kinds_ptr: Vec<*const i8>,
@@ -80,7 +78,7 @@ struct Executable {
 }
 
 impl Executable {
-    fn new() -> Self {
+    fn new(model: coreml::Model) -> Self {
         // TODO(knielsen): Fix these memory_kinds to line up with COREML_MEMORYS
         let memory_kinds = vec![CString::new("CoreML Unified Memory").unwrap()];
         let memory_kinds_ptr: Vec<*const i8> = memory_kinds.iter()
@@ -94,6 +92,7 @@ impl Executable {
             pjrt_executable: PJRT_Executable{ _unused: [0; 0] },
             // TODO(knielsen): Implement proper fingerprinting!
             fingerprint: CString::new(Uuid::new_v4().to_string()).unwrap(),
+            model,
             memory_kinds,
             memory_kinds_ptr,
             memory_kinds_sizes,
@@ -120,30 +119,37 @@ struct Buffer {
     pjrt_buffer: PJRT_Buffer,
     ref_count: usize,
 
-    buffer: Option<CoreMLBuffer>,
+    buffer: coreml::Buffer,
 
     // Buffered fields to provide to the C API
     dims: Vec<i64>,
 }
 
 impl Buffer {
-    fn new(mut maybe_buffer: Option<CoreMLBuffer>) -> Self {
-        let dims = match maybe_buffer {
-            Some(ref mut tensor) => tensor.shape(),
-            None => vec![],
-        };
+    fn new(typed_buffer: coreml::Buffer) -> Self {
+        let dims = typed_buffer.shape();
         debug!["Created buffer with shape: {:?}", dims];
 
         Buffer {
             pjrt_buffer: PJRT_Buffer { _unused: [0; 0] },
             ref_count: 0,
-            buffer: maybe_buffer,
+            buffer: typed_buffer,
             dims,
         }
     }
 
-    pub fn raw_data_pointer(&mut self) -> Option<*mut c_void> {
-        self.buffer.as_mut().map(|mut buffer| buffer.raw_data_pointer())
+    pub unsafe fn raw_data_pointer(&mut self) -> Option<*mut c_void> {
+        self.buffer.raw_data_pointer()
+    }
+
+    pub fn populate_buffer(&mut self, new_buffer: coreml::Buffer) {
+        match self.buffer {
+            coreml::Buffer::None => {
+                // This is ok to populate
+            },
+            _ => todo!("Attempted to populate a non-None buffer. This is unexpected!")
+        }
+        self.buffer = new_buffer;
     }
 }
 
@@ -176,7 +182,7 @@ struct Event {
 }
 
 impl Event {
-    fn new(task: JoinHandle<()>) -> Self {
+    fn new(task: JoinHandle<i32>) -> Self {
         let mut event = Event {
             event: PJRT_Event { _unused: [0; 0] },
             future: None,
@@ -185,7 +191,8 @@ impl Event {
 
         let callback_info_ref = event.callback_info.clone();
         let run_task_and_perform_callbacks = task::spawn(async move {
-            task.await;
+            let result = task.await;
+            info!["Obtained result {} from background task", result];
 
             let mut callback_info = callback_info_ref.lock().unwrap();
             callback_info.task_completed = true;
@@ -326,7 +333,7 @@ pub unsafe extern "C" fn EventAwait(arg_ptr: *mut PJRT_Event_Await_Args) -> *mut
 pub unsafe extern "C" fn EventOnReady(arg_ptr: *mut PJRT_Event_OnReady_Args) -> *mut PJRT_Error {
     info!("EventOnReady was called...");
 
-    let mut event_ptr = (*arg_ptr).event as *mut Event;
+    let event_ptr = (*arg_ptr).event as *mut Event;
     (*event_ptr).add_callback(EventCallback {
         callback: (*arg_ptr).callback,
         user_arg: (*arg_ptr).user_arg,
@@ -505,12 +512,15 @@ pub unsafe extern "C" fn ClientCompile(arg_ptr: *mut PJRT_Client_Compile_Args) -
     debug!["Compiling program with format {:?}", format];
 
     let mlir_module= unsafe { slice::from_raw_parts((*program_ptr).code as *const u8, (*program_ptr).code_size) };
-    let coreml_model = py_translate::stablehlo_to_coreml(mlir_module);
+    match coreml::Model::from_mlir(mlir_module) {
+        Ok(coreml_model) => {
+            let executable = Box::new(LoadedExecutable::new(Executable::new(coreml_model)));
+            (*arg_ptr).executable = Box::into_raw(executable) as *mut PJRT_LoadedExecutable;
 
-    let executable = Box::new(LoadedExecutable::new(Executable::new()));
-    (*arg_ptr).executable = Box::into_raw(executable) as *mut PJRT_LoadedExecutable;
-
-    ptr::null_mut()
+            ptr::null_mut()
+        },
+        Err(err) => Error::new_alloc(format!["Failed to convert StableHLO -> CoreML: {:?}", err])
+    }
 }
 
 #[no_mangle]
@@ -781,39 +791,53 @@ pub unsafe extern "C" fn LoadedExecutableIsDeleted(arg_ptr: *mut PJRT_LoadedExec
 #[no_mangle]
 pub unsafe extern "C" fn LoadedExecutableExecute(arg_ptr: *mut PJRT_LoadedExecutable_Execute_Args) -> *mut PJRT_Error {
     info!("LoadedExecutableExecute was called...");
-
-    // TODO(knielsen): Implement actual execution...
+    if (*arg_ptr).num_devices != 1 {
+        return Error::new_alloc(format!["Expected exactly 1 CoreML device!"]);
+    }
 
     let loaded_executable_ptr = (*arg_ptr).executable as *mut LoadedExecutable;
-    let num_outputs = (*loaded_executable_ptr).executable.memory_kinds.len();
-
-    if (*arg_ptr).num_devices != 1 {
-        panic!("There should be exactly 1 CoreML device!");
-    }
-
-    for output_idx in 0..num_outputs {
-        // TODO(knielsen): Get this information from the program. For now just make up something...
-        let elementType = coreml::ElementType::F16;
-        let shape = vec![3, 2];
-        let strides = vec![2, 1];
-
-        let coreml_buffer = coreml::CoreMLBuffer::allocate_shape(elementType, shape, strides);
-        let buffer = Box::new(Buffer::new(Some(coreml_buffer)));
-
+    
+    let output_specs = (*loaded_executable_ptr).executable.model.outputs();
+    let mut output_buffers = vec![];
+    for (output_idx, output_spec) in output_specs.into_iter().enumerate() {
+        let output_buffer = Box::new(Buffer::new(coreml::Buffer::None));
         let device_outputs = *(*arg_ptr).output_lists;
-        *device_outputs.add(output_idx) = Box::into_raw(buffer) as *mut PJRT_Buffer;
+
+        let output_buffer_ptr = Box::into_raw(output_buffer);
+        *device_outputs.add(output_idx) = output_buffer_ptr as *mut PJRT_Buffer;
+        
+        output_buffers.push(&mut *output_buffer_ptr);
     }
 
-    if !(*arg_ptr).device_complete_events.is_null() {
-        let future = task::spawn(async {
-            info!("Pretending to run computation in the background...");
-            task::sleep(std::time::Duration::from_secs(10)).await;
-            info!("Finished pretended computation...");
-        });
-        let event = Box::new(Event::new(future));
-        let events_ptr = (*arg_ptr).device_complete_events;
-        *events_ptr = Box::into_raw(event) as *mut PJRT_Event;
+    let input_ptrs = *(*arg_ptr).argument_lists; // Defref device
+    let mut inputs = vec![];
+    for i in 0..(*arg_ptr).num_args {
+        let buffer = *input_ptrs.add(i) as *mut Buffer;
+        inputs.push(&(*buffer).buffer); // Push the CoreML buffer
     }
+
+    if (*arg_ptr).device_complete_events.is_null() {
+        todo!["The case of device_complete_events being null is not implemented yet!"];
+    }
+
+    let model = &(*loaded_executable_ptr).executable.model;
+    let execute_model_future: JoinHandle<i32> = task::spawn(async move {
+        info!("Pretending to run computation in the background...");
+
+        task::sleep(std::time::Duration::from_secs(10)).await;
+        let outputs = model.predict(inputs.as_slice());
+
+        for (coreml_output, output_buffer) in outputs.into_iter().zip(output_buffers.into_iter()) {
+            output_buffer.populate_buffer(coreml_output);
+        }
+
+        info!("Finished pretended computation...");
+
+        1337
+    });
+    let event = Box::new(Event::new(execute_model_future));
+    let events_ptr = (*arg_ptr).device_complete_events;
+    *events_ptr = Box::into_raw(event) as *mut PJRT_Event;
 
     ptr::null_mut()
 }
@@ -918,8 +942,11 @@ pub unsafe extern "C" fn BufferDelete(arg_ptr: *mut PJRT_Buffer_Delete_Args) -> 
 pub unsafe extern "C" fn BufferIsDeleted(arg_ptr: *mut PJRT_Buffer_IsDeleted_Args) -> *mut PJRT_Error {
     info!("BufferIsDeleted was called...");
 
-    // TODO(knielsen): Support deletion...
-    (*arg_ptr).is_deleted = false;
+    let buffer_ptr = (*arg_ptr).buffer as *mut Buffer;
+    (*arg_ptr).is_deleted = match (*buffer_ptr).buffer {
+        coreml::Buffer::None => true,
+        _ => false,
+    };
 
     ptr::null_mut()
 }
@@ -948,7 +975,10 @@ pub unsafe extern "C" fn BufferIsOnCpu(arg_ptr: *mut PJRT_Buffer_IsOnCpu_Args) -
 pub unsafe extern "C" fn BufferReadyEvent(arg_ptr: *mut PJRT_Buffer_ReadyEvent_Args) -> *mut PJRT_Error {
     info!("BufferReadyEvent was called...");
 
-    let buffer_immediately_ready = task::spawn(async {});
+    let buffer_immediately_ready = task::spawn(async {
+        task::sleep(std::time::Duration::from_secs(10)).await;
+        5
+    });
     let event = Box::new(Event::new(buffer_immediately_ready));
     (*arg_ptr).event = Box::into_raw(event) as *mut PJRT_Event;
 
@@ -986,7 +1016,7 @@ pub unsafe extern "C" fn BufferDecreaseRefCount(arg_ptr: *mut PJRT_Buffer_Decrea
 
 #[no_mangle]
 pub unsafe extern "C" fn BufferOpaqueDeviceMemoryDataPointer(arg_ptr: *mut PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args) -> *mut PJRT_Error {
-    info!("BufferDecreaseRefCount was called...");
+    info!("BufferOpaqueDeviceMemoryDataPointer was called...");
 
     let mut buffer_ptr = (*arg_ptr).buffer as *mut Buffer;
     (*arg_ptr).device_memory_ptr = (*buffer_ptr).raw_data_pointer().unwrap();
@@ -1030,24 +1060,33 @@ pub unsafe extern "C" fn ClientBufferFromHostBuffer(arg_ptr: *mut PJRT_Client_Bu
         }
     }
 
-    // Compute element type
-    let element_type = match (*arg_ptr).type_ {
-        PJRT_Buffer_Type_PJRT_Buffer_Type_F16 => coreml::ElementType::F16,
-        PJRT_Buffer_Type_PJRT_Buffer_Type_F32 => coreml::ElementType::F32,
-        PJRT_Buffer_Type_PJRT_Buffer_Type_F64 => coreml::ElementType::F64,
-        PJRT_Buffer_Type_PJRT_Buffer_Type_S32 => coreml::ElementType::I32,
+    let numElements = (shape.iter().product::<i64>() as usize);
+
+    // TODO(knielsen): Consider refactoring this to completely hide InternalBuffer
+    let typed_buffer: coreml::Buffer = match (*arg_ptr).type_ {
+        // PJRT_Buffer_Type_PJRT_Buffer_Type_F16 => coreml::ElementType::F16,
+        PJRT_Buffer_Type_PJRT_Buffer_Type_F32 => {
+            let data = unsafe { slice::from_raw_parts((*arg_ptr).data as *const f32, numElements) };
+            coreml::Buffer::Float32(coreml::InternalBuffer::<f32>::new(shape, &strides, data))
+        },
+        PJRT_Buffer_Type_PJRT_Buffer_Type_F64 => {
+            let data = unsafe { slice::from_raw_parts((*arg_ptr).data as *const f64, numElements) };
+            coreml::Buffer::Float64(coreml::InternalBuffer::<f64>::new(shape, &strides, data))
+        },
+        PJRT_Buffer_Type_PJRT_Buffer_Type_S32 => {
+            let data = unsafe { slice::from_raw_parts((*arg_ptr).data as *const i32, numElements) };
+            coreml::Buffer::Int32(coreml::InternalBuffer::<i32>::new(shape, &strides, data))
+        },
         unsupported_type => todo!("Type not yet supported: {:?}", unsupported_type)
     };
-
-    let numBytes = (shape.iter().product::<i64>() as usize) * element_type.width();
-    let data = unsafe { slice::from_raw_parts((*arg_ptr).data as *const u8, numBytes) };
-
-    let coreml_buffer = CoreMLBuffer::allocate_from_data(data, element_type, shape, &strides);
-    let buffer = Box::new(Buffer::new(Some(coreml_buffer)));
+    let buffer = Box::new(Buffer::new(typed_buffer));
 
     (*arg_ptr).buffer = Box::into_raw(buffer) as *mut PJRT_Buffer;
 
-    let data_ptr_can_be_freed_immediately = task::spawn(async {});
+    let data_ptr_can_be_freed_immediately = task::spawn(async {
+        task::sleep(std::time::Duration::from_secs(10)).await;
+        1
+    });
     let event = Box::new(Event::new(data_ptr_can_be_freed_immediately));
     (*arg_ptr).done_with_host_buffer = Box::into_raw(event) as *mut PJRT_Event;
 
