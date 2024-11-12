@@ -199,6 +199,7 @@ impl<T: Clone + numpy::Element> InternalBuffer<T> {
         let raw_strides: Vec<_> = raw_strides.iter().map(|s| *s as usize).collect();
 
         let shape = raw_shape.strides(raw_strides);
+        debug!("Constructing array with shape: {:?}", shape);
         let array = ndarray::ArrayView::from_shape(shape, data).unwrap();
         let owned_array = array.into_owned(); // Notice, this will trigger a data copy
 

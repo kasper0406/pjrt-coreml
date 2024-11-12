@@ -1040,13 +1040,20 @@ pub unsafe extern "C" fn ClientBufferFromHostBuffer(arg_ptr: *mut PJRT_Client_Bu
     info!("ClientBufferFromHostBuffer was called");
     
     // Compute shape
-    let shape = unsafe { slice::from_raw_parts((*arg_ptr).dims, (*arg_ptr).num_dims) };
+    let mut shape = unsafe { slice::from_raw_parts((*arg_ptr).dims, (*arg_ptr).num_dims) };
+    // TODO: Refactor where scalar_shape is stored
+    let scalar_shape = vec![1];
+    if shape.len() == 0 {
+        // Special case for scalar values
+        shape = &scalar_shape;
+    }
     info!["Shape: {:?}", shape];
 
     // Compute strides
     let mut strides = vec![];
     if (*arg_ptr).device_layout.is_null() {
         // Major-to-minor order
+        // Special case for scalar
         strides.push(1);
         for (axis, dimension) in shape.iter().skip(1).rev().enumerate() {
             strides.push(dimension * strides[axis]);
