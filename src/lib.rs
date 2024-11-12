@@ -149,6 +149,7 @@ impl Buffer {
             },
             _ => todo!("Attempted to populate a non-None buffer. This is unexpected!")
         }
+        self.dims = new_buffer.shape();
         self.buffer = new_buffer;
     }
 }
@@ -182,7 +183,7 @@ struct Event {
 }
 
 impl Event {
-    fn new(task: JoinHandle<i32>) -> Self {
+    fn new(task: JoinHandle<()>) -> Self {
         let mut event = Event {
             event: PJRT_Event { _unused: [0; 0] },
             future: None,
@@ -191,8 +192,7 @@ impl Event {
 
         let callback_info_ref = event.callback_info.clone();
         let run_task_and_perform_callbacks = task::spawn(async move {
-            let result = task.await;
-            info!["Obtained result {} from background task", result];
+            task.await;
 
             let mut callback_info = callback_info_ref.lock().unwrap();
             callback_info.task_completed = true;
@@ -821,19 +821,28 @@ pub unsafe extern "C" fn LoadedExecutableExecute(arg_ptr: *mut PJRT_LoadedExecut
     }
 
     let model = &(*loaded_executable_ptr).executable.model;
-    let execute_model_future: JoinHandle<i32> = task::spawn(async move {
-        info!("Pretending to run computation in the background...");
 
-        task::sleep(std::time::Duration::from_secs(10)).await;
-        let outputs = model.predict(inputs.as_slice());
+    // TODO(knielsen): For now just execute inside this method. Figure out how callbacks work?
+    match model.predict(inputs.as_slice()) {
+        Ok(outputs) => {
+            for (coreml_output, output_buffer) in outputs.into_iter().zip(output_buffers.into_iter()) {
+                output_buffer.populate_buffer(coreml_output);
+            }
+        },
+        Err(err) => return Error::new_alloc(format!["Failed to evaluate model: {:?}", err]),
+    }
 
-        for (coreml_output, output_buffer) in outputs.into_iter().zip(output_buffers.into_iter()) {
-            output_buffer.populate_buffer(coreml_output);
-        }
+    let execute_model_future = task::spawn(async move {
+        // info!("Pretending to run computation in the background...");
 
-        info!("Finished pretended computation...");
+        // task::sleep(std::time::Duration::from_secs(10)).await;
+        // let outputs = model.predict(inputs.as_slice());
 
-        1337
+        // for (coreml_output, output_buffer) in outputs.into_iter().zip(output_buffers.into_iter()) {
+        //     output_buffer.populate_buffer(coreml_output);
+        // }
+
+        // info!("Finished pretended computation...");
     });
     let event = Box::new(Event::new(execute_model_future));
     let events_ptr = (*arg_ptr).device_complete_events;
@@ -975,10 +984,7 @@ pub unsafe extern "C" fn BufferIsOnCpu(arg_ptr: *mut PJRT_Buffer_IsOnCpu_Args) -
 pub unsafe extern "C" fn BufferReadyEvent(arg_ptr: *mut PJRT_Buffer_ReadyEvent_Args) -> *mut PJRT_Error {
     info!("BufferReadyEvent was called...");
 
-    let buffer_immediately_ready = task::spawn(async {
-        task::sleep(std::time::Duration::from_secs(10)).await;
-        5
-    });
+    let buffer_immediately_ready = task::spawn(async {});
     let event = Box::new(Event::new(buffer_immediately_ready));
     (*arg_ptr).event = Box::into_raw(event) as *mut PJRT_Event;
 
@@ -1083,10 +1089,7 @@ pub unsafe extern "C" fn ClientBufferFromHostBuffer(arg_ptr: *mut PJRT_Client_Bu
 
     (*arg_ptr).buffer = Box::into_raw(buffer) as *mut PJRT_Buffer;
 
-    let data_ptr_can_be_freed_immediately = task::spawn(async {
-        task::sleep(std::time::Duration::from_secs(10)).await;
-        1
-    });
+    let data_ptr_can_be_freed_immediately = task::spawn(async {});
     let event = Box::new(Event::new(data_ptr_can_be_freed_immediately));
     (*arg_ptr).done_with_host_buffer = Box::into_raw(event) as *mut PJRT_Event;
 

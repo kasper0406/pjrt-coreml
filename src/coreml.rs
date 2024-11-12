@@ -1,20 +1,13 @@
-use numpy::ndarray::ArcArray;
 use numpy::PyArrayMethods;
 use numpy::PyUntypedArrayMethods;
 use pyo3::prelude::*;
-use pyo3::types::IntoPyDict;
 use pyo3::types::PyDict;
 use pyo3::types::PyBytes;
 use pyo3::types::PyList;
+use pyo3::types::IntoPyDict;
 
-use numpy::PyArray;
 use numpy::PyArrayDyn;
 use ndarray::ShapeBuilder;
-
-use tempfile::TempDir;
-use std::fs::File;
-use std::io::Write;
-use std::path::Path;
 
 use log::{debug, info, warn};
 
@@ -99,12 +92,38 @@ impl Model {
         })
     }
 
-    pub fn predict(&self, inputs: &[&Buffer]) -> Vec<Buffer> {
+    pub fn predict(&self, inputs: &[&Buffer]) -> Result<Vec<Buffer>, PyErr> {
         info!["Calling CoreML model with {} inputs", inputs.len()];
-        warn!("Currently returning some bogus data...");
-        vec![
-            Buffer::Float32(InternalBuffer::<f32>::new(&vec![3], &vec![1], &vec![10.1, 20.2, 1.0]))
-        ]
+
+        Python::with_gil(|py| {
+            let model = self.model.bind(py);
+            let predict_func = model.getattr("predict")?;
+
+            let list_func = py.import_bound("builtins")?.getattr("list")?;
+            let input_description_obj = model.getattr("input_description")?;
+            let inputs_list = list_func.call1((input_description_obj, ))?;
+            let input_names = inputs_list.downcast::<PyList>()?;
+
+            let mut model_inputs = vec![];
+            for (input_name, input_value) in input_names.iter().zip(inputs.iter()) {
+                model_inputs.push((input_name, input_value.py_buffer()));
+            }
+
+            let model_result = predict_func.call((model_inputs.into_py_dict_bound(py), ), None)?;
+            debug!["Evaluated model prediction and got: {:?}", model_result];
+
+            // TODO(knielsen): Refactor this to a helper function
+            let output_description_obj = model.getattr("output_description")?;
+            let outputs_list = list_func.call1((output_description_obj, ))?;
+            let output_names = outputs_list.downcast::<PyList>()?;
+
+            let result_buffers = output_names.iter()
+                .map(|output_name| model_result.get_item(output_name).unwrap())
+                .map(|py_output| Buffer::from_py(py_output))
+                .collect();
+
+            Ok(result_buffers)
+        })
     }
 }
 
@@ -134,6 +153,38 @@ impl Buffer {
             Self::Float64(buf) => Some(buf.raw_data_pointer()),
             Self::Int32(buf) => Some(buf.raw_data_pointer()),
             Self::None => None,
+        }
+    }
+
+    pub fn py_buffer(&self) -> &Py<PyAny> {
+        match self {
+            // Self::Float16(buf) => Some(buf.raw_data_pointer()),
+            Self::Float32(buf) => buf.buffer.as_any(),
+            Self::Float64(buf) => buf.buffer.as_any(),
+            Self::Int32(buf) => buf.buffer.as_any(),
+            Self::None => todo!("The Python buffer should not be None at this point!"),
+        }
+    }
+    
+    pub fn from_py<'py>(py_obj: Bound<'py, PyAny>) -> Buffer {
+        // Find a better way of doing this...
+        let dtype = py_obj.getattr("dtype").unwrap().to_string();
+        debug!["Discovered dtype: {:?}", dtype];
+
+        match dtype.as_str() {
+            "float32" => {
+                let internal_buffer = py_obj.downcast_into::<PyArrayDyn<f32>>().unwrap().unbind();
+                Buffer::Float32(InternalBuffer { buffer: internal_buffer })
+            },
+            "float64" => {
+                let internal_buffer = py_obj.downcast_into::<PyArrayDyn<f64>>().unwrap().unbind();
+                Buffer::Float64(InternalBuffer { buffer: internal_buffer })
+            },
+            "int32" => {
+                let internal_buffer = py_obj.downcast_into::<PyArrayDyn<i32>>().unwrap().unbind();
+                Buffer::Int32(InternalBuffer { buffer: internal_buffer })
+            },
+            _ => todo!("Unsupported numpy dtype: {:?}", dtype)
         }
     }
 }
