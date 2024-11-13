@@ -4,6 +4,19 @@ The hope is to at some point to get Jax to execute on the Apple Neural Engine (A
 
 The ANE is a piece of dedicated hardware withing M-series processors allowing fast and memory-efficient calculations on `fp16` types.
 
+## How to use
+In order to run there examples, you need to:
+
+1. Set up a new Python 3.10 or 3.11 (coremltools requirement) environment
+2. Install the `stablehlo-coreml-experimental` python package
+3. Use the Rust nightly toolchain, and build the dylib using `cargo build`
+4. Run the examples, fx `python tests/test_simple.py`
+
+To gain additional error and debug information, you can run the program as:
+```sh
+RUST_BACKTRACE=1 RUST_LOG=DEBUG python tests/test_simple.py
+```
+
 # Missing functionality
 
 * Highly experimental, and not well tested
