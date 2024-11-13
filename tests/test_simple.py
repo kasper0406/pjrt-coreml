@@ -20,6 +20,5 @@ size = 1024 * 8
 a = jnp.ones((size, size), dtype=jnp.float32)
 b = jnp.ones((size, size), dtype=jnp.float32)
 
-for i in range(10):
-    print(f"Calculating prodct {i}")
-    print(calculate_matrix_product(a, b))
+result = calculate_matrix_product(a, b)
+print(result)
