@@ -55,17 +55,19 @@ impl Model {
             let mil_converter = stablehlo_coreml.getattr("convert")?;
             let target_macos15 = ct.getattr("target")?.getattr("macOS15")?;
             let mil_program = mil_converter.call((hlo_module, &target_macos15), None)?;
-            debug!["Constructed MIL program: {:?}", mil_program];
+            // debug!["Constructed MIL program: {:?}", mil_program];
 
             // Convert to CoreML
-            let empty_pipeline = ct.getattr("PassPipeline")?.getattr("EMPTY")?;
+            // let empty_pipeline = ct.getattr("PassPipeline")?.getattr("EMPTY")?;
+            let default_hlo_pipeline = stablehlo_coreml.getattr("DEFAULT_HLO_PIPELINE")?;
             let coreml_converter = ct.getattr("convert")?;
             let kwargs = PyDict::new_bound(py);
             kwargs.set_item("source", "milinternal")?;
             kwargs.set_item("minimum_deployment_target", &target_macos15)?;
-            kwargs.set_item("pass_pipeline", empty_pipeline)?;
+            kwargs.set_item("pass_pipeline", default_hlo_pipeline)?;
             let coreml_model = coreml_converter.call((mil_program, ), Some(&kwargs))?;
-            debug!["Constructed CoreML model: {:?}", coreml_model];
+            debug!["CoreML program: {:?}", coreml_model.getattr("_mil_program")?];
+            debug!["CoreML model: {:?}", coreml_model];
 
             Ok(Model { model: coreml_model.into() })
         });
@@ -109,7 +111,9 @@ impl Model {
                 model_inputs.push((input_name, input_value.py_buffer()));
             }
 
-            let model_result = predict_func.call((model_inputs.into_py_dict_bound(py), ), None)?;
+            let model_input_dict = model_inputs.into_py_dict_bound(py);
+            debug!["Calling the model with inputs {:?}", model_input_dict];
+            let model_result = predict_func.call((model_input_dict, ), None)?;
             debug!["Evaluated model prediction and got: {:?}", model_result];
 
             // TODO(knielsen): Refactor this to a helper function
@@ -128,40 +132,58 @@ impl Model {
 }
 
 pub enum Buffer {
-    // Float16(coreml::Buffer<f16>),
+    Float16(InternalBuffer<WrappedF16>),
     Float32(InternalBuffer<f32>),
     Float64(InternalBuffer<f64>),
     Int32(InternalBuffer<i32>),
+    UInt32(InternalBuffer<i32>), // TODO(knielsen): Fix this :'(
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct WrappedF16(f16);
+unsafe impl numpy::Element for WrappedF16 {
+    const IS_COPY: bool = true;
+
+    fn get_dtype_bound(py: Python<'_>) -> Bound<'_, numpy::PyArrayDescr> {
+        u16::get_dtype_bound(py)
+    }
+
+    fn clone_ref(&self, _py: Python<'_>) -> Self {
+        *self
+    }
 }
 
 impl Buffer {
     pub fn shape(&self) -> Vec<i64> {
         match self {
-            // Self::Float16(buf) => buf.shape(),
+            Self::Float16(buf) => buf.shape(),
             Self::Float32(buf) => buf.shape(),
             Self::Float64(buf) => buf.shape(),
             Self::Int32(buf) => buf.shape(),
+            Self::UInt32(buf) => buf.shape(),
             Self::None => vec![],
         }
     }
     
     pub unsafe fn raw_data_pointer(&mut self) -> Option<*mut std::ffi::c_void> {
         match self {
-            // Self::Float16(buf) => Some(buf.raw_data_pointer()),
+            Self::Float16(buf) => Some(buf.raw_data_pointer()),
             Self::Float32(buf) => Some(buf.raw_data_pointer()),
             Self::Float64(buf) => Some(buf.raw_data_pointer()),
             Self::Int32(buf) => Some(buf.raw_data_pointer()),
+            Self::UInt32(buf) => Some(buf.raw_data_pointer()),
             Self::None => None,
         }
     }
 
     pub fn py_buffer(&self) -> &Py<PyAny> {
         match self {
-            // Self::Float16(buf) => Some(buf.raw_data_pointer()),
+            Self::Float16(buf) => buf.buffer.as_any(),
             Self::Float32(buf) => buf.buffer.as_any(),
             Self::Float64(buf) => buf.buffer.as_any(),
             Self::Int32(buf) => buf.buffer.as_any(),
+            Self::UInt32(buf) => buf.buffer.as_any(),
             Self::None => todo!("The Python buffer should not be None at this point!"),
         }
     }
@@ -172,6 +194,10 @@ impl Buffer {
         debug!["Discovered dtype: {:?}", dtype];
 
         match dtype.as_str() {
+            "float16" => {
+                let internal_buffer = py_obj.downcast_into::<PyArrayDyn<WrappedF16>>().unwrap().unbind();
+                Buffer::Float16(InternalBuffer { buffer: internal_buffer })
+            },
             "float32" => {
                 let internal_buffer = py_obj.downcast_into::<PyArrayDyn<f32>>().unwrap().unbind();
                 Buffer::Float32(InternalBuffer { buffer: internal_buffer })
@@ -183,6 +209,10 @@ impl Buffer {
             "int32" => {
                 let internal_buffer = py_obj.downcast_into::<PyArrayDyn<i32>>().unwrap().unbind();
                 Buffer::Int32(InternalBuffer { buffer: internal_buffer })
+            },
+            "uint32" => {
+                let internal_buffer = py_obj.downcast_into::<PyArrayDyn<i32>>().unwrap().unbind();
+                Buffer::UInt32(InternalBuffer { buffer: internal_buffer })
             },
             _ => todo!("Unsupported numpy dtype: {:?}", dtype)
         }

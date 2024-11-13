@@ -21,6 +21,7 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::alloc::{alloc, dealloc, Layout};
+use coreml::WrappedF16;
 use uuid::Uuid;
 use std::future::Future;
 use async_std::prelude::*;
@@ -692,12 +693,20 @@ pub unsafe extern "C" fn ExecutableName(arg_ptr: *mut PJRT_Executable_Name_Args)
 
 #[no_mangle]
 pub unsafe extern "C" fn ExecutableNumReplicas(arg_ptr: *mut PJRT_Executable_NumReplicas_Args) -> *mut PJRT_Error {
-    todo!("Implement ExecutableNumReplicas")
+    info!("ExecutableNumReplicas was called...");
+
+    (*arg_ptr).num_replicas = 1;
+
+    ptr::null_mut()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ExecutableNumPartitions(arg_ptr: *mut PJRT_Executable_NumPartitions_Args) -> *mut PJRT_Error {
-    todo!("Implement ExecutableNumPartitions")
+    info!("ExecutableNumPartitions was called...");
+
+    (*arg_ptr).num_partitions = 1;
+
+    ptr::null_mut()
 }
 
 #[no_mangle]
@@ -740,16 +749,7 @@ pub unsafe extern "C" fn ExecutableOptimizedProgram(arg_ptr: *mut PJRT_Executabl
     (*(*arg_ptr).program).format = PLATFORM_NAME.as_ptr();
     (*(*arg_ptr).program).format_size = PLATFORM_NAME.count_bytes();
 
-    if (*(*arg_ptr).program).code.is_null() {
-        // Calculate the size of the code
-        (*(*arg_ptr).program).code_size = 16;
-    } else {
-        let num_bytes = (*(*arg_ptr).program).code_size;
-        let bytes = vec![0; num_bytes];
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*(*arg_ptr).program).code, num_bytes);
-    }
-
-    ptr::null_mut()
+    return Error::new_alloc(format!["Program is always optimized. Consider delaying optimizations here."]);
 }
 
 #[no_mangle]
@@ -1077,7 +1077,10 @@ pub unsafe extern "C" fn ClientBufferFromHostBuffer(arg_ptr: *mut PJRT_Client_Bu
 
     // TODO(knielsen): Consider refactoring this to completely hide InternalBuffer
     let typed_buffer: coreml::Buffer = match (*arg_ptr).type_ {
-        // PJRT_Buffer_Type_PJRT_Buffer_Type_F16 => coreml::ElementType::F16,
+        PJRT_Buffer_Type_PJRT_Buffer_Type_F16 => {
+            let data = unsafe { slice::from_raw_parts((*arg_ptr).data as *const WrappedF16, numElements) };
+            coreml::Buffer::Float16(coreml::InternalBuffer::<coreml::WrappedF16>::new(shape, &strides, data))
+        },
         PJRT_Buffer_Type_PJRT_Buffer_Type_F32 => {
             let data = unsafe { slice::from_raw_parts((*arg_ptr).data as *const f32, numElements) };
             coreml::Buffer::Float32(coreml::InternalBuffer::<f32>::new(shape, &strides, data))
@@ -1089,6 +1092,10 @@ pub unsafe extern "C" fn ClientBufferFromHostBuffer(arg_ptr: *mut PJRT_Client_Bu
         PJRT_Buffer_Type_PJRT_Buffer_Type_S32 => {
             let data = unsafe { slice::from_raw_parts((*arg_ptr).data as *const i32, numElements) };
             coreml::Buffer::Int32(coreml::InternalBuffer::<i32>::new(shape, &strides, data))
+        },
+        PJRT_Buffer_Type_PJRT_Buffer_Type_U32 => {
+            let data = unsafe { slice::from_raw_parts((*arg_ptr).data as *const i32, numElements) };
+            coreml::Buffer::UInt32(coreml::InternalBuffer::<i32>::new(shape, &strides, data))
         },
         unsupported_type => todo!("Type not yet supported: {:?}", unsupported_type)
     };
