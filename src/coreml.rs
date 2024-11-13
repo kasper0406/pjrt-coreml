@@ -9,6 +9,9 @@ use pyo3::types::IntoPyDict;
 use numpy::PyArrayDyn;
 use ndarray::ShapeBuilder;
 
+use std::sync::Arc;
+use std::sync::Mutex;
+
 use log::{debug, info, warn};
 
 #[derive(Debug)]
@@ -20,9 +23,68 @@ pub struct Model {
     model: Py<PyAny>,
 }
 
+
+#[pyclass]
+#[derive(Clone)]
+struct PyOutputCapture {
+    buffer: Arc<Mutex<Option<Vec<String>>>>,
+}
+
+#[pymethods]
+impl PyOutputCapture {
+    fn write(&self, data: &str) {
+        let mut maybe_buffer = self.buffer.lock().unwrap();
+        // TODO(knielsen): Is there a cleaner way of doing this?
+        if maybe_buffer.is_some() {
+            let buffer = maybe_buffer.as_mut().unwrap();
+            buffer.push(String::from(data));
+        } else {
+            print!("{}", data);
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+impl PyOutputCapture {
+    fn start_capture(&mut self) {
+        let mut maybe_buffer = self.buffer.lock().unwrap();
+        *maybe_buffer = Some(vec![]);
+    }
+
+    fn end_capture(&mut self) -> Vec<String> {
+        let mut maybe_buffer = self.buffer.lock().unwrap();
+        if maybe_buffer.is_some() {
+            let buffer = maybe_buffer.as_mut().unwrap();
+            let result = buffer.clone();
+            *maybe_buffer = None;
+
+            result
+        } else {
+            vec![]
+        }
+    }
+}
+
+lazy_static! {
+    static ref PY_OUTPUT_BUFFER: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
+    static ref PY_OUTPUT_CAPTURE: PyOutputCapture = PyOutputCapture { buffer: PY_OUTPUT_BUFFER.clone() };
+}
+
+pub fn capture_python_stdout() {
+    Python::with_gil(|py| {
+        let sys = py.import_bound("sys").unwrap();
+        sys.setattr("stdout", PY_OUTPUT_CAPTURE.clone().into_py(py)).unwrap();
+        sys.setattr("stderr", PY_OUTPUT_CAPTURE.clone().into_py(py)).unwrap();
+    })
+}
+
 impl Model {
     pub fn from_mlir(mlir_module: &[u8]) -> Result<Model, ()> {
         debug!["Attempting to call Python!"];
+
+        let mut output_capture = PY_OUTPUT_CAPTURE.clone();
+        output_capture.start_capture();
 
         let model_result: Result<Model, pyo3::PyErr> = Python::with_gil(|py| {
             // Construct the MLIR module
@@ -55,7 +117,6 @@ impl Model {
             let mil_converter = stablehlo_coreml.getattr("convert")?;
             let target_macos15 = ct.getattr("target")?.getattr("macOS15")?;
             let mil_program = mil_converter.call((hlo_module, &target_macos15), None)?;
-            // debug!["Constructed MIL program: {:?}", mil_program];
 
             // Convert to CoreML
             // let empty_pipeline = ct.getattr("PassPipeline")?.getattr("EMPTY")?;
@@ -67,11 +128,11 @@ impl Model {
             kwargs.set_item("pass_pipeline", default_hlo_pipeline)?;
             let coreml_model = coreml_converter.call((mil_program, ), Some(&kwargs))?;
             debug!["CoreML program: {:?}", coreml_model.getattr("_mil_program")?];
-            debug!["CoreML model: {:?}", coreml_model];
 
             Ok(Model { model: coreml_model.into() })
         });
-        info!("Result of constructing CoreML model: {:?}", &model_result);
+        let python_output = output_capture.end_capture();
+        debug!["Python output converting model {:?}: {:?}", &model_result, python_output];
 
         // TODO(knielsen): Add a proper error return!
         model_result.map_err(|err| ())
@@ -97,7 +158,10 @@ impl Model {
     pub fn predict(&self, inputs: &[&Buffer]) -> Result<Vec<Buffer>, PyErr> {
         info!["Calling CoreML model with {} inputs", inputs.len()];
 
-        Python::with_gil(|py| {
+        let mut output_capture = PY_OUTPUT_CAPTURE.clone();
+        output_capture.start_capture();
+
+        let prediction_result = Python::with_gil(|py| {
             let model = self.model.bind(py);
             let predict_func = model.getattr("predict")?;
 
@@ -127,7 +191,12 @@ impl Model {
                 .collect();
 
             Ok(result_buffers)
-        })
+        });
+        
+        let python_output = output_capture.end_capture();
+        debug!["Python output for model prediction: {:?}", python_output];
+
+        return prediction_result;
     }
 }
 

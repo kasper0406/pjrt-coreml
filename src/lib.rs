@@ -290,6 +290,7 @@ pub unsafe extern "C" fn ErrorGetCode(arg_ptr: *mut PJRT_Error_GetCode_Args) -> 
 pub unsafe extern "C" fn PluginInitialize(arg_ptr: *mut PJRT_Plugin_Initialize_Args) -> *mut PJRT_Error {
     info!("PluginInitialize was called...");
     env_logger::init();
+    coreml::capture_python_stdout();
 
     ptr::null_mut()
 }

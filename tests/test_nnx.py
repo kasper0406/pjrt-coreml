@@ -1,25 +1,11 @@
-import os
 import jax
-import jax._src.xla_bridge as xb
 import jax.numpy as jnp
-
-import faulthandler
-faulthandler.enable()
-
-
-def initialize():
-    path = os.path.join(os.path.dirname(__file__), 'target/debug/libpjrt_coreml.dylib')
-    xb.register_plugin('pjrt-coreml', priority=500, library_path=path, options=None)
-
-
-initialize()
-jax.config.update("jax_platforms", "pjrt-coreml")
-
-
+from setup_jax import initialize_jax_coreml
 import matplotlib.pyplot as plt
 import numpy as np
-
 from flax import nnx
+
+initialize_jax_coreml()
 
 X = np.linspace(0, 1, 100)[:, None]
 Y = 0.8 * X**2 + 0.1 + np.random.normal(0, 0.1, size=X.shape)
