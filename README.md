@@ -25,5 +25,12 @@ RUST_BACKTRACE=1 RUST_LOG=DEBUG python tests/test_simple.py
 
 # Benchmarks
 
-I need to perform some proper benchmarks...
+I did a benchmark result of a matrix multiplication test followed by a reduction to calculate the maximum element (see `tests/run_benchmarks.py` for details).
 
+The key finding is that the power-consumption of the CoreML based implementation is more energy efficient than the Metal (GPU) based implementation in jax-metal.
+
+![Power consumption](plots/power_consumption.png)
+
+However, the running time of using CoreML is around 3x slower compared to jax-metal:
+
+![Running time](plots/running_time.png)
