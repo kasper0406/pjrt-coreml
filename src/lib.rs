@@ -1,4 +1,4 @@
-#![feature(vec_into_raw_parts, box_as_ptr, async_closure, f16)]
+#![feature(vec_into_raw_parts, box_as_ptr, async_closure, f16, type_alias_impl_trait)]
 
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
@@ -13,21 +13,15 @@ mod coreml;
 
 use core::slice;
 use std::ffi::c_void;
-use std::os::raw::c_int;
 use std::ffi::CString;
 use std::ptr;
-use std::sync::RwLock;
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::alloc::{alloc, dealloc, Layout};
 use coreml::WrappedF16;
 use uuid::Uuid;
-use std::future::Future;
-use async_std::prelude::*;
 use async_std::task;
 use async_std::task::JoinHandle;
 use std::sync::{Arc, Mutex};
+use async_std::future::Future;
+use std::pin::Pin;
 
 use sysinfo::System;
 
@@ -116,11 +110,14 @@ impl LoadedExecutable {
     }
 }
 
+type BufferReadyNotifier = Pin<Box<dyn Future<Output=()> + Send + 'static>>;
+
 struct Buffer {
     pjrt_buffer: PJRT_Buffer,
     ref_count: usize,
 
     buffer: coreml::Buffer,
+    ready_notifiers: Vec<BufferReadyNotifier>,
 
     // Buffered fields to provide to the C API
     dims: Vec<i64>,
@@ -135,6 +132,7 @@ impl Buffer {
             pjrt_buffer: PJRT_Buffer { _unused: [0; 0] },
             ref_count: 0,
             buffer: typed_buffer,
+            ready_notifiers: vec![],
             dims,
         }
     }
@@ -152,6 +150,24 @@ impl Buffer {
         }
         self.dims = new_buffer.shape();
         self.buffer = new_buffer;
+
+        // Inform listeners that the buffer is ready
+        while let Some(ready_notifier) = self.ready_notifiers.pop() {
+            task::spawn(ready_notifier);
+        }
+    }
+
+    pub fn notify_when_ready(&mut self, ready_notifier: BufferReadyNotifier) {
+        match self.buffer {
+            coreml::Buffer::None => {
+                debug!["Waiting for buffer to become available..."];
+                self.ready_notifiers.push(ready_notifier);
+            },
+            _ => {
+                // The buffer is already ready, so we can just inform the ready_notifier directly
+                task::spawn(ready_notifier);
+            }
+        };
     }
 }
 
@@ -162,9 +178,11 @@ struct EventCallback {
 }
 unsafe impl Send for EventCallback {}
 
+#[derive(Debug)]
 struct CallbackInfo {
     task_completed: bool,
     callbacks: Vec<EventCallback>,
+    destroy_when_done: Option<*mut Event>,
 }
 
 impl CallbackInfo {
@@ -172,10 +190,13 @@ impl CallbackInfo {
         CallbackInfo {
             task_completed: false,
             callbacks: vec![],
+            destroy_when_done: None,
         }
     }
 }
+unsafe impl Send for CallbackInfo {}
 
+#[derive(Debug)]
 struct Event {
     event: PJRT_Event,
 
@@ -191,6 +212,7 @@ impl Event {
             callback_info: Arc::new(Mutex::new(CallbackInfo::new())),
         };
 
+        // TODO(knielsen): Is there a cleaner way of cleaning up?
         let callback_info_ref = event.callback_info.clone();
         let run_task_and_perform_callbacks = task::spawn(async move {
             task.await;
@@ -202,6 +224,11 @@ impl Event {
                 unsafe { callback.callback.unwrap()(ptr::null_mut(), callback.user_arg) };
             }
             callback_info.callbacks.clear();
+
+            if let Some(event_ptr_to_free) = callback_info.destroy_when_done {
+                debug!["Destroying event after finishing all callbacks"];
+                let event = unsafe { Box::from_raw(event_ptr_to_free) };
+            }
         });
         event.future = Some(run_task_and_perform_callbacks);
 
@@ -217,6 +244,31 @@ impl Event {
             unsafe { callback.callback.unwrap()(ptr::null_mut(), callback.user_arg) };
         } else {
             callback_info.callbacks.push(callback);
+        }
+    }
+
+    fn is_task_completed(&self) -> bool {
+        let callback_info = self.callback_info.lock().unwrap();
+        callback_info.task_completed
+    }
+
+    // Destroy the event once the task and all callbacks finish executing
+    fn enqueue_destruction(&mut self) {
+        let mut destroy_now = false;
+        {
+            let mut callback_info = self.callback_info.lock().unwrap();
+            if callback_info.task_completed {
+                destroy_now = true;
+            } else {
+                // We can not destroy it right now, but we know (due to the mutex of callback_info),
+                // that callbacks will be executed. We enque destruction at the end of callback
+                // execution.
+                callback_info.destroy_when_done = Some(ptr::from_ref(self) as *mut Event);
+            }
+        }
+        if destroy_now {
+            debug!["Task already completed, simply destroy the event"];
+            drop(unsafe { Box::from_raw(ptr::from_mut(self)) });
         }
     }
 }
@@ -309,9 +361,7 @@ pub unsafe extern "C" fn EventDestroy(arg_ptr: *mut PJRT_Event_Destroy_Args) -> 
     info!("EventDestroy was called...");
 
     let event_ptr = (*arg_ptr).event as *mut Event;
-    if !event_ptr.is_null() {
-        drop(Box::from_raw(event_ptr));
-    }
+    (*event_ptr).enqueue_destruction();
 
     ptr::null_mut()
 }
@@ -835,12 +885,17 @@ pub unsafe extern "C" fn LoadedExecutableExecute(arg_ptr: *mut PJRT_LoadedExecut
 
     let execute_model_future = task::spawn(async move {
         // info!("Pretending to run computation in the background...");
+        info!["Running computation in the background"];
 
         // task::sleep(std::time::Duration::from_secs(10)).await;
-        // let outputs = model.predict(inputs.as_slice());
-
-        // for (coreml_output, output_buffer) in outputs.into_iter().zip(output_buffers.into_iter()) {
-        //     output_buffer.populate_buffer(coreml_output);
+        
+        // match model.predict(inputs.as_slice()) {
+        //     Ok(outputs) => {
+        //         for (coreml_output, output_buffer) in outputs.into_iter().zip(output_buffers.into_iter()) {
+        //             output_buffer.populate_buffer(coreml_output);
+        //         }
+        //     },
+        //     Err(err) => warn!("Failed computation!"),
         // }
 
         // info!("Finished pretended computation...");
@@ -952,11 +1007,7 @@ pub unsafe extern "C" fn BufferDelete(arg_ptr: *mut PJRT_Buffer_Delete_Args) -> 
 pub unsafe extern "C" fn BufferIsDeleted(arg_ptr: *mut PJRT_Buffer_IsDeleted_Args) -> *mut PJRT_Error {
     info!("BufferIsDeleted was called...");
 
-    let buffer_ptr = (*arg_ptr).buffer as *mut Buffer;
-    (*arg_ptr).is_deleted = match (*buffer_ptr).buffer {
-        coreml::Buffer::None => true,
-        _ => false,
-    };
+    (*arg_ptr).is_deleted = false;
 
     ptr::null_mut()
 }
@@ -985,8 +1036,19 @@ pub unsafe extern "C" fn BufferIsOnCpu(arg_ptr: *mut PJRT_Buffer_IsOnCpu_Args) -
 pub unsafe extern "C" fn BufferReadyEvent(arg_ptr: *mut PJRT_Buffer_ReadyEvent_Args) -> *mut PJRT_Error {
     info!("BufferReadyEvent was called...");
 
-    let buffer_immediately_ready = task::spawn(async {});
-    let event = Box::new(Event::new(buffer_immediately_ready));
+    let (buffer_ready_notifier, buffer_ready_receiver) = async_std::channel::bounded::<()>(1);
+
+    let buffer_ptr = (*arg_ptr).buffer as *mut Buffer;
+    (*buffer_ptr).notify_when_ready(Box::pin(async move {
+        debug!["Sending buffer ready event"];
+        buffer_ready_notifier.send(()).await.unwrap()
+    }));
+
+    let buffer_became_ready = task::spawn(async move {
+        buffer_ready_receiver.recv().await.unwrap();
+        debug!["Received buffer ready event"];
+    });
+    let event = Box::new(Event::new(buffer_became_ready));
     (*arg_ptr).event = Box::into_raw(event) as *mut PJRT_Event;
 
     ptr::null_mut()
